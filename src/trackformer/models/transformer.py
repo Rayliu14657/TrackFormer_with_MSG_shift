@@ -76,8 +76,8 @@ class Transformer(nn.Module):
                                            prev_frame=prev_frame)
 
         return (hs.transpose(1, 2),
-            hs_without_norm.transpose(1, 2),
-            memory.permute(1, 2, 0).view(bs, c, h, w))
+                hs_without_norm.transpose(1, 2),
+                memory.permute(1, 2, 0).view(bs, c, h, w))
 
 
 class TransformerEncoder(nn.Module):
@@ -87,20 +87,73 @@ class TransformerEncoder(nn.Module):
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
+        self.msg_shift = []
+        self.shift_strides = [1, -1, 2, -2]
+        # the length of the msg_tokens
+        self.msg_token_len = 32
+
+        # set shift directions of msg-tokens for each layer
+        encoder_layers = self.num_layers
+        for lid in range(encoder_layers):
+            if lid % 2 == 0:
+                # append the [1,-1,2,-2] into the msg_shift
+                self.msg_shift.append([_ for _ in self.shift_strides])
+
+            else:
+                # append the [-1,1,-2,2] into the msg_shift
+                # shift back
+                self.msg_shift.append([-_ for _ in self.shift_strides])
+
+        if encoder_layers % 2 == 1:
+            # avoid only shift no shift back
+            self.msg_shift[-1] = None
 
     def forward(self, src,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None):
         output = src
+        src_device = src.device
+        # msg_tokens are linked at the tail of each src token
+        # get the shape of the src tensor
+        src_shape = src.shape
+        hw, batch_size, d = src_shape
+        # initialize the msg_tokens with zeros in the shape of (batch_size, msg_token_len, d_model)
+        msg_tokens = torch.zeros(self.msg_token_len, batch_size, d)
+        msg_tokens = msg_tokens.to(src_device)
+        # create additional mask for the msg token
+        # msg_token_mask = torch.ones(batch_size, self.msg_token_len, dtype=torch.bool)
 
+
+        # concat the msg_token with the patch_token serves as the input
+        # output = torch.cat((output, msg_tokens), dim=0)
+
+        layer_count = 0
         for layer in self.layers:
+            layer_count += 1
             output = layer(output, src_mask=mask,
                            src_key_padding_mask=src_key_padding_mask, pos=pos)
 
+            output = output[:, :-self.msg_token_len, ...]
+
+            msg_tokens = output[:, -self.msg_token_len:, ...]
+
+            # perform the msg token shuffle
+            # only shuffles when the msg_shift directions are inited
+            if self.msg_shift is not None:
+                current_msg_shift_direction = self.msg_shift[layer_count]
+                # chunk the msg_token into 4 groups
+                chunked_msg_tokens = msg_tokens.chunk(len(current_msg_shift_direction), dim=0)
+                # roll the token groups along the dim 0 with the direction in variable current_msg_shift_direction
+                shuffled_tokens = [torch.roll(msg_token, roll, dims=0) for msg_token, roll in
+                              zip(chunked_msg_tokens, current_msg_shift_direction)]
+
+                msg_tokens = torch.cat(shuffled_tokens, dim=0)
+
+            output = torch.cat((output, msg_tokens), dim=0)
+
         if self.norm is not None:
             output = self.norm(output)
-
         return output
 
 

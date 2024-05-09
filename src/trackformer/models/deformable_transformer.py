@@ -10,7 +10,7 @@
 import math
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.nn.init import constant_, normal_, xavier_uniform_
 
 from ..util.misc import inverse_sigmoid
@@ -22,7 +22,7 @@ class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024,
                  dropout=0.1, activation="relu", return_intermediate_dec=False,
-                 num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
+                 num_feature_levels=4, dec_n_points=4, enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300,
                  multi_frame_attention_separate_encoder=False):
         super().__init__()
@@ -200,7 +200,6 @@ class DeformableTransformer(nn.Module):
             reference_points = self.reference_points(query_embed).sigmoid()
 
             if targets is not None and 'track_query_hs_embeds' in targets[0]:
-
                 # print([t['track_query_hs_embeds'].shape for t in targets])
                 # prev_hs_embed = torch.nn.utils.rnn.pad_sequence([t['track_query_hs_embeds'] for t in targets], batch_first=True, padding_value=float('nan'))
                 # prev_boxes = torch.nn.utils.rnn.pad_sequence([t['track_query_boxes'] for t in targets], batch_first=True, padding_value=float('nan'))
@@ -275,6 +274,11 @@ class DeformableTransformerEncoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
+        # self attention for src_msg
+        self.msg_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.norm_msg = nn.LayerNorm(d_model)
+        self.dropout_msg = nn.Dropout(dropout)
+
     @staticmethod
     def with_pos_embed(tensor, pos):
         return tensor if pos is None else tensor + pos
@@ -285,8 +289,25 @@ class DeformableTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, pos, reference_points, spatial_shapes, padding_mask=None):
+    def forward(self, src, pos, reference_points, spatial_shapes, padding_mask=None, msg_tokens=None):
+        # keep the original size of the src tokens
+        batch_size, n, d = src.shape
+        if msg_tokens is not None:
+            msg_len = msg_tokens.shape[1]
+            # get the new src, pos
+            src_msg, pos_msg, mask_msg = self.positional_encoding_with_MSG(src, msg_tokens, padding_mask)
+            # calculate self attention on src tokens with msg tokens
+            q_msg = k_msg = self.with_pos_embed(src, pos)
+            src2 = self.msg_attention(q_msg, k_msg, value=src, attn_mask=None,
+                                      key_padding_mask=mask_msg)[0]
+            src = src + self.dropout_msg(src2)
+            src_fin = self.norm_msg(src)
+            # split the src and msg_tokens
+            src = src_fin[:, :-msg_len, ...]
+            msg_tokens = src_fin[:, -msg_len:, ...]
         # self attention
+        # (2, 15420, 288)
+        # (2, 15420)
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
@@ -294,7 +315,54 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # ffn
         src = self.forward_ffn(src)
 
-        return src
+        if msg_tokens is not None:
+            return src, msg_tokens
+        else:
+            return src, None
+
+    @staticmethod
+    def positional_encoding_with_MSG(src, msg_tokens, padding_mask):
+        temperature = 10000
+        scale = 2 * math.pi
+        eps = 1e-6
+        # follow the positional encoding function in the PositionEmbeddingSine3D
+        src_shape = src.shape
+        batch_size, n, d = src_shape
+
+        # concat the src tokens with the msg_token
+        src = torch.cat((src, msg_tokens), dim=1)
+
+        # msg_token len
+        msg_len = msg_tokens.shape[1]
+
+        num_pos_feats = n + msg_len
+
+        # generate the mask for the msg_tokens
+        msg_mask = torch.full((batch_size, msg_len), False, dtype=torch.bool, device=src.device)
+
+        # concat the msg_mask and the padding_mask to create the new src_mask
+        src_mask = torch.cat((padding_mask, msg_mask), dim=1)
+
+        # generate the positional embedding
+        assert src_mask is not None
+        not_mask = ~src_mask
+        # calculate cumsum on dim1(tokens_num) to get the position encoding for the position
+        pos = not_mask.cumsum(1, dtype=torch.float32)
+
+        # normalize the pos
+        pos = pos / (pos[:, -1:] + eps) * scale
+
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=src.device)
+        dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+
+        pos = pos / dim_t
+
+        PE = torch.zeros(batch_size, n + msg_len, d)
+
+        PE[:, :, 0::2] = pos[:, :, 0::2].sin()
+        PE[:, :, 1::2] = pos[:, :, 1::2].cos()
+
+        return src, PE, src_mask
 
 
 class DeformableTransformerEncoder(nn.Module):
@@ -303,11 +371,31 @@ class DeformableTransformerEncoder(nn.Module):
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
 
+        # msg shift direction
+        self.msg_shift = []
+        self.shift_strides = [1, -1, 2, -2]
+        self.msg_token_len = 32
+
+        # set shift directions of msg-tokens for each layer
+        encoder_layers = self.num_layers
+        for lid in range(encoder_layers):
+            if lid % 2 == 0:
+                # append the [1,-1,2,-2] into the msg_shift
+                self.msg_shift.append([_ for _ in self.shift_strides])
+
+            else:
+                # append the [-1,1,-2,2] into the msg_shift
+                # shift back
+                self.msg_shift.append([-_ for _ in self.shift_strides])
+
+        if encoder_layers % 2 == 1:
+            # avoid only shift no shift back
+            self.msg_shift[-1] = None
+
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
-
             ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
                                           torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
@@ -320,9 +408,27 @@ class DeformableTransformerEncoder(nn.Module):
 
     def forward(self, src, spatial_shapes, valid_ratios, pos=None, padding_mask=None):
         output = src
+        src_shape = src.shape
+        batch_size, n, d = src_shape
+        # initialize the msg_tokens with zeros in the shape of (batch_size, msg_token_len, d_model)
+        msg_tokens = torch.zeros(batch_size, self.msg_token_len, d)
+        msg_tokens = msg_tokens.to(src.device)
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
+        layer_count = 0
         for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, padding_mask)
+            layer_count += 1
+            output, msg_tokens = layer(output, pos, reference_points, spatial_shapes, padding_mask, msg_tokens)
+            # perform the msg token shuffle
+            # only shuffles when the msg_shift directions are inited
+            if self.msg_shift and msg_tokens:
+                current_msg_shift_direction = self.msg_shift[layer_count]
+                # chunk the msg_token into 4 groups
+                chunked_msg_tokens = msg_tokens.chunk(len(current_msg_shift_direction), dim=1)
+                # roll the token groups along the dim 0 with the direction in variable current_msg_shift_direction
+                shuffled_tokens = [torch.roll(msg_token, roll, dims=1) for msg_token, roll in
+                                   zip(chunked_msg_tokens, current_msg_shift_direction)]
+
+                msg_tokens = torch.cat(shuffled_tokens, dim=1)
 
         return output
 
@@ -361,11 +467,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, src_padding_mask=None, query_attn_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, src_padding_mask=None,
+                query_attn_mask=None):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
 
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), key_padding_mask=query_attn_mask)[0].transpose(0, 1)
+        tgt2 = \
+        self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), key_padding_mask=query_attn_mask)[
+            0].transpose(0, 1)
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
@@ -406,7 +515,8 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_padding_mask, query_attn_mask)
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_padding_mask,
+                           query_attn_mask)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
@@ -432,7 +542,6 @@ class DeformableTransformerDecoder(nn.Module):
 
 
 def build_deforamble_transformer(args):
-
     num_feature_levels = args.num_feature_levels
     if args.multi_frame_attention:
         num_feature_levels *= 2

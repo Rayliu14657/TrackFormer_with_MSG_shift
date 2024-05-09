@@ -91,6 +91,7 @@ def train(args: Namespace) -> None:
     print('NUM TRAINABLE MODEL PARAMS:', n_parameters)
 
     def match_name_keywords(n, name_keywords):
+        # Check if n is in set name_keywords. If so, return True; else return False.
         out = False
         for b in name_keywords:
             if b in n:
@@ -98,6 +99,12 @@ def train(args: Namespace) -> None:
                 break
         return out
 
+    # model_without_ddp.named_parameters(): return an iterable obj contains para name and para itself.
+    # for n, p in...: n is the para name and p is the para
+    # name_keywords = args.lr_backbone_names + args.lr_linear_proj_names + ['layers_track_attention']
+    # if not match_name_keywords(n, name_keywords): if n(para name) is not in name_keywords
+    # and p.requires_grad: para need to calculate grad
+    # the value for key "params": model paras that is not in name_keywords and requires grad
     param_dicts = [
         {"params": [p for n, p in model_without_ddp.named_parameters()
                     if not match_name_keywords(n, args.lr_backbone_names + args.lr_linear_proj_names + ['layers_track_attention']) and p.requires_grad],

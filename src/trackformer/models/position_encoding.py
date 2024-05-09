@@ -29,19 +29,26 @@ class PositionEmbeddingSine3D(nn.Module):
         self.scale = scale
 
     def forward(self, tensor_list: NestedTensor):
+        # mask is used to determine which is tensor and which is padding
         x = tensor_list.tensors
         mask = tensor_list.mask
+        # n for batch size, h for height, and w for width.
         n, h, w = mask.shape
         # assert n == 1
         # mask = mask.reshape(1, 1, h, w)
+        # adding a new dim to the mask
         mask = mask.view(n, 1, h, w)
+        # expand along the dim1 to the self.frames size
         mask = mask.expand(n, self.frames, h, w)
 
+        # check to ensure that the mask is not None.
         assert mask is not None
+        # not_mask  = !mask
         not_mask = ~mask
         # y_embed = not_mask.cumsum(1, dtype=torch.float32)
         # x_embed = not_mask.cumsum(2, dtype=torch.float32)
 
+        # calculate cumsum on dim1(frames), dim2(height) and dim3(width) to get the position encoding for the position
         z_embed = not_mask.cumsum(1, dtype=torch.float32)
         y_embed = not_mask.cumsum(2, dtype=torch.float32)
         x_embed = not_mask.cumsum(3, dtype=torch.float32)
@@ -152,14 +159,17 @@ def build_position_encoding(args):
     # n_steps = args.hidden_dim // 2
     # n_steps = args.hidden_dim // 4
     if args.multi_frame_attention and args.multi_frame_encoding:
+        # hidden_dim = 288
         n_steps = args.hidden_dim // 3
         sine_emedding_func = PositionEmbeddingSine3D
     else:
+        # hidden_dim = 256
         n_steps = args.hidden_dim // 2
         sine_emedding_func = PositionEmbeddingSine
 
     if args.position_embedding in ('v2', 'sine'):
         # TODO find a better way of exposing other arguments
+
         position_embedding = sine_emedding_func(n_steps, normalize=True)
     elif args.position_embedding in ('v3', 'learned'):
         position_embedding = PositionEmbeddingLearned(n_steps)

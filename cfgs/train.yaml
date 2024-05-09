@@ -30,9 +30,11 @@ position_embedding: sine
 num_feature_levels: 1
 # Transformer
 # Number of encoding layers in the transformer
-enc_layers: 6
+# change 6 to 2 to accelerate training
+enc_layers: 2
 # Number of decoding layers in the transformer
-dec_layers: 6
+# change 6 to 2 to accelerate training
+dec_layers: 2
 # Intermediate size of the feedforward layers in the transformer blocks
 dim_feedforward: 2048
 # Size of the embeddings (dimension of the transformer)
