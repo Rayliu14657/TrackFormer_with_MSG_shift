@@ -295,11 +295,18 @@ class DeformableTransformerEncoderLayer(nn.Module):
         if msg_tokens is not None:
             msg_len = msg_tokens.shape[1]
             # get the new src, pos
-            src_msg, pos_msg, mask_msg = self.positional_encoding_with_MSG(src, msg_tokens, padding_mask)
+            src, pos_msg, mask_msg = self.positional_encoding_with_MSG(src, msg_tokens, padding_mask)
             # calculate self attention on src tokens with msg tokens
-            q_msg = k_msg = self.with_pos_embed(src, pos)
+            q_msg = k_msg = self.with_pos_embed(src, pos_msg)
+            # turn the tensors from (n,l,c) to (l,n,c)
+            q_msg = q_msg.permute(1, 0, 2)
+            k_msg = k_msg.permute(1, 0, 2)
+            src = src.permute(1, 0, 2)
             src2 = self.msg_attention(q_msg, k_msg, value=src, attn_mask=None,
                                       key_padding_mask=mask_msg)[0]
+            # turn the tensors from (l,n,c) to (n,l,c)
+            src2 = src2.permute(1, 0, 2)
+            src = src.permute(1, 0, 2)
             src = src + self.dropout_msg(src2)
             src_fin = self.norm_msg(src)
             # split the src and msg_tokens
@@ -335,7 +342,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # msg_token len
         msg_len = msg_tokens.shape[1]
 
-        num_pos_feats = n + msg_len
+        num_pos_feats = d
 
         # generate the mask for the msg_tokens
         msg_mask = torch.full((batch_size, msg_len), False, dtype=torch.bool, device=src.device)
@@ -355,9 +362,9 @@ class DeformableTransformerEncoderLayer(nn.Module):
         dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=src.device)
         dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
 
-        pos = pos / dim_t
+        pos = pos[:, :, None] / dim_t
 
-        PE = torch.zeros(batch_size, n + msg_len, d)
+        PE = torch.zeros(batch_size, n + msg_len, d, device=src.device)
 
         PE[:, :, 0::2] = pos[:, :, 0::2].sin()
         PE[:, :, 1::2] = pos[:, :, 1::2].cos()
