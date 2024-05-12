@@ -24,3 +24,4 @@ src/trackformer/models/ops/lib*
 src/trackformer/models/ops/temp*
 nohup.out
 terminal-log.txt
+dist
