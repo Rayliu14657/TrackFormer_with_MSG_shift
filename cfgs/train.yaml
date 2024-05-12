@@ -134,7 +134,7 @@ world_size: 1
 dist_url: env://
 # Visdom params
 # vis_server: http://localhost
-vis_server: ''
-vis_port: 8090
+vis_server: 'http://localhost'
+vis_port: 8091
 vis_and_log_interval: 50
 no_vis: false
