@@ -396,7 +396,7 @@ class DeformableTransformerEncoder(nn.Module):
         # msg shift direction
         self.msg_shift = []
         self.shift_strides = [1, -1, 2, -2]
-        self.msg_token_len = 32
+        self.msg_token_len = 256
 
         # set shift directions of msg-tokens for each layer
         encoder_layers = self.num_layers
