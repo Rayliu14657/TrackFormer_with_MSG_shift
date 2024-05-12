@@ -294,27 +294,42 @@ class DeformableTransformerEncoderLayer(nn.Module):
         batch_size, n, d = src.shape
         if msg_tokens is not None:
             msg_len = msg_tokens.shape[1]
-            # get the new src, pos
-            src, pos_msg, mask_msg = self.positional_encoding_with_MSG(src, msg_tokens, padding_mask)
-            # calculate self attention on src tokens with msg tokens
-            q_msg = k_msg = self.with_pos_embed(src, pos_msg)
-            # turn the tensors from (n,l,c) to (l,n,c)
-            q_msg = q_msg.permute(1, 0, 2)
-            k_msg = k_msg.permute(1, 0, 2)
-            src = src.permute(1, 0, 2)
-            src2 = self.msg_attention(q_msg, k_msg, value=src, attn_mask=None,
-                                      key_padding_mask=mask_msg)[0]
-            # turn the tensors from (l,n,c) to (n,l,c)
-            src2 = src2.permute(1, 0, 2)
-            src = src.permute(1, 0, 2)
-            src = src + self.dropout_msg(src2)
-            src_fin = self.norm_msg(src)
-            # split the src and msg_tokens
-            src = src_fin[:, :-msg_len, ...]
-            msg_tokens = src_fin[:, -msg_len:, ...]
-        # self attention
-        # (2, 15420, 288)
-        # (2, 15420)
+            # chunk the msg_tokens into 4 windows
+            window_num = 4
+            chunked_msg_tokens = msg_tokens.chunk(window_num, dim=1)
+            # chunk the src tokens into 4 windows
+            chunked_src = src.chunk(window_num, dim=1)
+            # chunk the src mask into 4 windows
+            chunked_padding_mask = padding_mask.chunk(window_num, dim=1)
+            # cat each window a msg_token, also adjust the mask
+            src_windows = []
+            msg_windows = []
+            for src_window, msg_window, mask_window in zip(chunked_src, chunked_msg_tokens, chunked_padding_mask):
+                # get the new src, pos
+                src_window, pos_window, mask_window = self.positional_encoding_with_MSG(src_window,
+                                                                                        msg_window,
+                                                                                        mask_window)
+                # calculate self attention on src tokens with msg tokens
+                q_msg = k_msg = self.with_pos_embed(src_window, pos_window)
+                # turn the tensors from (n,l,c) to (l,n,c)
+                q_msg = q_msg.permute(1, 0, 2)
+                k_msg = k_msg.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window2 = self.msg_attention(q_msg, k_msg, value=src_window, attn_mask=None,
+                                                 key_padding_mask=msg_window)[0]
+                # turn the tensors from (l,n,c) to (n,l,c)
+                src_window2 = src_window2.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window = src_window + self.dropout_msg(src_window2)
+                src_window_fin = self.norm_msg(src_window)
+                src_window_fin = self.forward_ffn(src_window_fin)
+                # split the src and msg_tokens
+                src_window_trained = src_window_fin[:, :-msg_len//window_num, ...]
+                msg_window_trained = src_window_fin[:, -msg_len//window_num:, ...]
+                src_windows.append(src_window_trained)
+                msg_windows.append(msg_window_trained)
+            src = torch.cat(src_windows, dim=1)
+            msg_tokens = torch.cat(msg_windows, dim=1)
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
@@ -423,11 +438,10 @@ class DeformableTransformerEncoder(nn.Module):
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         layer_count = 0
         for _, layer in enumerate(self.layers):
-            layer_count += 1
             output, msg_tokens = layer(output, pos, reference_points, spatial_shapes, padding_mask, msg_tokens)
             # perform the msg token shuffle
             # only shuffles when the msg_shift directions are inited
-            if self.msg_shift and msg_tokens:
+            if self.msg_shift:
                 current_msg_shift_direction = self.msg_shift[layer_count]
                 # chunk the msg_token into 4 groups
                 chunked_msg_tokens = msg_tokens.chunk(len(current_msg_shift_direction), dim=1)
@@ -436,6 +450,7 @@ class DeformableTransformerEncoder(nn.Module):
                                    zip(chunked_msg_tokens, current_msg_shift_direction)]
 
                 msg_tokens = torch.cat(shuffled_tokens, dim=1)
+            layer_count += 1
 
         return output
 
@@ -480,8 +495,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         q = k = self.with_pos_embed(tgt, query_pos)
 
         tgt2 = \
-        self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), key_padding_mask=query_attn_mask)[
-            0].transpose(0, 1)
+            self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), key_padding_mask=query_attn_mask)[
+                0].transpose(0, 1)
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
