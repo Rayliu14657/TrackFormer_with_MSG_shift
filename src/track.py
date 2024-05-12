@@ -19,7 +19,7 @@ from trackformer.util.misc import nested_dict_to_namespace
 from trackformer.util.track_utils import (evaluate_mot_accums, get_mot_accum,
                                           interpolate_tracks, plot_sequence)
 
-mm.lap.default_solver = 'lap'
+mm.lap.default_solver = 'scipy'
 
 ex = sacred.Experiment('track')
 ex.add_config('cfgs/track.yaml')
