@@ -316,8 +316,8 @@ class TransformerWithMSGEncoderLayer(nn.Module):
 
         # self attention for src_msg
         self.msg_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout_msg = nn.Dropout(dropout)
+        self.norm_msg = nn.LayerNorm(d_model)
 
     @staticmethod
     def positional_encoding_with_MSG(src, msg_tokens, padding_mask):
@@ -393,6 +393,7 @@ class TransformerWithMSGEncoderLayer(nn.Module):
                 src_window, pos_window, mask_window = self.positional_encoding_with_MSG(src_window,
                                                                                         msg_window,
                                                                                         mask_window)
+
                 # calculate self attention on src tokens with msg tokens
                 q_msg = k_msg = self.with_pos_embed(src_window, pos_window)
                 # turn the tensors from (n,l,c) to (l,n,c)
@@ -406,18 +407,18 @@ class TransformerWithMSGEncoderLayer(nn.Module):
                 src_window = src_window.permute(1, 0, 2)
                 src_window = src_window + self.dropout_msg(src_window2)
                 src_window_fin = self.norm_msg(src_window)
+
+                # ffn
                 src_window_fin = self.forward_ffn(src_window_fin)
+
                 # split the src and msg_tokens
                 src_window_trained = src_window_fin[:, :-msg_len // window_num, ...]
                 msg_window_trained = src_window_fin[:, -msg_len // window_num:, ...]
-                src_window_trained = src + self.dropout1(src_window_trained)
-                src_window_trained = self.norm1(src_window_trained)
                 src_windows.append(src_window_trained)
                 msg_windows.append(msg_window_trained)
             src = torch.cat(src_windows, dim=1)
             msg_tokens = torch.cat(msg_windows, dim=1)
-            # ffn
-            src = self.forward_ffn(src)
+
             return src, msg_tokens
         else:
             return src, None
