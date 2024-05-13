@@ -469,6 +469,8 @@ class DeformableTransformerEncoder(nn.Module):
         batch_size, n, d = src_shape
         # initialize the msg_tokens with zeros in the shape of (batch_size, msg_token_len, d_model)
         msg_tokens = torch.zeros(batch_size, self.msg_token_len, d)
+        # initialize the msg_tokens
+        torch.nn.init.trunc_normal_(msg_tokens, std=.02)
         msg_tokens = msg_tokens.to(src.device)
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         layer_deformable_0 = self.layers[0]
