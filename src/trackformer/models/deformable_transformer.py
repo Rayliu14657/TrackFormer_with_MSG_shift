@@ -40,7 +40,9 @@ class DeformableTransformer(nn.Module):
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           enc_num_feature_levels, nhead, enc_n_points)
-        self.encoder = DeformableTransformerEncoder(encoder_layer, num_encoder_layers)
+        msg_encoder_layer = TransformerWithMSGEncoderLayer(d_model, dim_feedforward,
+                                                           dropout, activation, nhead)
+        self.encoder = DeformableTransformerEncoder(encoder_layer, msg_encoder_layer, num_encoder_layers)
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
@@ -274,10 +276,6 @@ class DeformableTransformerEncoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
-        # self attention for src_msg
-        self.msg_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-        self.norm_msg = nn.LayerNorm(d_model)
-        self.dropout_msg = nn.Dropout(dropout)
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -289,47 +287,8 @@ class DeformableTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, pos, reference_points, spatial_shapes, padding_mask=None, msg_tokens=None):
-        # keep the original size of the src tokens
-        batch_size, n, d = src.shape
-        if msg_tokens is not None:
-            msg_len = msg_tokens.shape[1]
-            # chunk the msg_tokens into 4 windows
-            window_num = 4
-            chunked_msg_tokens = msg_tokens.chunk(window_num, dim=1)
-            # chunk the src tokens into 4 windows
-            chunked_src = src.chunk(window_num, dim=1)
-            # chunk the src mask into 4 windows
-            chunked_padding_mask = padding_mask.chunk(window_num, dim=1)
-            # cat each window a msg_token, also adjust the mask
-            src_windows = []
-            msg_windows = []
-            for src_window, msg_window, mask_window in zip(chunked_src, chunked_msg_tokens, chunked_padding_mask):
-                # get the new src, pos
-                src_window, pos_window, mask_window = self.positional_encoding_with_MSG(src_window,
-                                                                                        msg_window,
-                                                                                        mask_window)
-                # calculate self attention on src tokens with msg tokens
-                q_msg = k_msg = self.with_pos_embed(src_window, pos_window)
-                # turn the tensors from (n,l,c) to (l,n,c)
-                q_msg = q_msg.permute(1, 0, 2)
-                k_msg = k_msg.permute(1, 0, 2)
-                src_window = src_window.permute(1, 0, 2)
-                src_window2 = self.msg_attention(q_msg, k_msg, value=src_window, attn_mask=None,
-                                                 key_padding_mask=msg_window)[0]
-                # turn the tensors from (l,n,c) to (n,l,c)
-                src_window2 = src_window2.permute(1, 0, 2)
-                src_window = src_window.permute(1, 0, 2)
-                src_window = src_window + self.dropout_msg(src_window2)
-                src_window_fin = self.norm_msg(src_window)
-                src_window_fin = self.forward_ffn(src_window_fin)
-                # split the src and msg_tokens
-                src_window_trained = src_window_fin[:, :-msg_len//window_num, ...]
-                msg_window_trained = src_window_fin[:, -msg_len//window_num:, ...]
-                src_windows.append(src_window_trained)
-                msg_windows.append(msg_window_trained)
-            src = torch.cat(src_windows, dim=1)
-            msg_tokens = torch.cat(msg_windows, dim=1)
+    def forward(self, src, pos, reference_points, spatial_shapes, padding_mask=None):
+        # self attention
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
@@ -337,10 +296,28 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # ffn
         src = self.forward_ffn(src)
 
-        if msg_tokens is not None:
-            return src, msg_tokens
-        else:
-            return src, None
+        return src
+
+
+class TransformerWithMSGEncoderLayer(nn.Module):
+    def __init__(self,
+                 d_model=256, d_ffn=1024,
+                 dropout=0.1, activation="relu",
+                 n_heads=8):
+        super().__init__()
+
+        # ffn
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout2 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # self attention for src_msg
+        self.msg_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.norm_msg = nn.LayerNorm(d_model)
+        self.dropout_msg = nn.Dropout(dropout)
 
     @staticmethod
     def positional_encoding_with_MSG(src, msg_tokens, padding_mask):
@@ -386,12 +363,73 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
         return src, PE, src_mask
 
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward_ffn(self, src):
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        src = src + self.dropout3(src2)
+        src = self.norm2(src)
+        return src
+
+    def forward(self, src, padding_mask=None, msg_tokens=None):
+        # keep the original size of the src tokens
+        batch_size, n, d = src.shape
+        if msg_tokens is not None:
+            msg_len = msg_tokens.shape[1]
+            # chunk the msg_tokens into 4 windows
+            window_num = 4
+            chunked_msg_tokens = msg_tokens.chunk(window_num, dim=1)
+            # chunk the src tokens into 4 windows
+            chunked_src = src.chunk(window_num, dim=1)
+            # chunk the src mask into 4 windows
+            chunked_padding_mask = padding_mask.chunk(window_num, dim=1)
+            # cat each window a msg_token, also adjust the mask
+            src_windows = []
+            msg_windows = []
+            for src_window, msg_window, mask_window in zip(chunked_src, chunked_msg_tokens, chunked_padding_mask):
+                # get the new src, pos
+                src_window, pos_window, mask_window = self.positional_encoding_with_MSG(src_window,
+                                                                                        msg_window,
+                                                                                        mask_window)
+                # calculate self attention on src tokens with msg tokens
+                q_msg = k_msg = self.with_pos_embed(src_window, pos_window)
+                # turn the tensors from (n,l,c) to (l,n,c)
+                q_msg = q_msg.permute(1, 0, 2)
+                k_msg = k_msg.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window2 = self.msg_attention(q_msg, k_msg, value=src_window, attn_mask=None,
+                                                 key_padding_mask=mask_window)[0]
+                # turn the tensors from (l,n,c) to (n,l,c)
+                src_window2 = src_window2.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window = src_window + self.dropout_msg(src_window2)
+                src_window_fin = self.norm_msg(src_window)
+                src_window_fin = self.forward_ffn(src_window_fin)
+                # split the src and msg_tokens
+                src_window_trained = src_window_fin[:, :-msg_len // window_num, ...]
+                msg_window_trained = src_window_fin[:, -msg_len // window_num:, ...]
+                src_windows.append(src_window_trained)
+                msg_windows.append(msg_window_trained)
+            src_trained = torch.cat(src_windows, dim=1)
+            msg_tokens = torch.cat(msg_windows, dim=1)
+            src = src + self.dropout1(src_trained)
+            src = self.norm1(src)
+            # ffn
+            src = self.forward_ffn(src)
+            return src, msg_tokens
+        else:
+            return src, None
+
 
 class DeformableTransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers):
+    def __init__(self, encoder_layer, msg_encoder_layer, num_layers):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
+        self.num_msg_layers = 2
+        self.msg_layers = _get_clones(msg_encoder_layer, self.num_msg_layers)
 
         # msg shift direction
         self.msg_shift = []
@@ -399,8 +437,8 @@ class DeformableTransformerEncoder(nn.Module):
         self.msg_token_len = 256
 
         # set shift directions of msg-tokens for each layer
-        encoder_layers = self.num_layers
-        for lid in range(encoder_layers):
+        msg_encoder_layers = self.num_msg_layers
+        for lid in range(msg_encoder_layers):
             if lid % 2 == 0:
                 # append the [1,-1,2,-2] into the msg_shift
                 self.msg_shift.append([_ for _ in self.shift_strides])
@@ -409,10 +447,6 @@ class DeformableTransformerEncoder(nn.Module):
                 # append the [-1,1,-2,2] into the msg_shift
                 # shift back
                 self.msg_shift.append([-_ for _ in self.shift_strides])
-
-        if encoder_layers % 2 == 1:
-            # avoid only shift no shift back
-            self.msg_shift[-1] = None
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -436,22 +470,37 @@ class DeformableTransformerEncoder(nn.Module):
         msg_tokens = torch.zeros(batch_size, self.msg_token_len, d)
         msg_tokens = msg_tokens.to(src.device)
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
+        layer_deformable_0 = self.layers[0]
+        layer_deformable_1 = self.layers[1]
+        # train with deformable transformer
+        output = layer_deformable_0(output, pos, reference_points, spatial_shapes, padding_mask)
+        # train with msg_tokens block
         layer_count = 0
-        for _, layer in enumerate(self.layers):
+        for _, layer in enumerate(self.msg_layers):
             output, msg_tokens = layer(output, pos, reference_points, spatial_shapes, padding_mask, msg_tokens)
             # perform the msg token shuffle
             # only shuffles when the msg_shift directions are inited
             if self.msg_shift:
                 current_msg_shift_direction = self.msg_shift[layer_count]
-                # chunk the msg_token into 4 groups
+                # chunk the msg_token to re-produse the msg_tokens for each window
                 chunked_msg_tokens = msg_tokens.chunk(len(current_msg_shift_direction), dim=1)
+                # stack the msg_tokens to form a msg_tokens stack -- "put the slices together"
+                stacked_msgt = torch.stack(chunked_msg_tokens)
+                # stacked_msgt: (number of chunked_msg_tokens, batch_size, chunked_length, d_model)
+                # chunk the stacked tokens in dim=2, which is the dim of chunked_length
+                # this is the chunk each msg_token into 4 groups -- "chop the stacked slices"
+                chunked_t = torch.chunk(stacked_msgt, 4, dim=2)
                 # roll the token groups along the dim 0 with the direction in variable current_msg_shift_direction
-                shuffled_tokens = [torch.roll(msg_token, roll, dims=1) for msg_token, roll in
-                                   zip(chunked_msg_tokens, current_msg_shift_direction)]
-
-                msg_tokens = torch.cat(shuffled_tokens, dim=1)
+                shuffled_chunked_tokens = [torch.roll(msg_token, roll, dims=1) for msg_token, roll in
+                                           zip(chunked_t, current_msg_shift_direction)]
+                shuffled_tokens = torch.cat(shuffled_chunked_tokens, dim=2)
+                new_msg_tokens_list = torch.chunk(shuffled_tokens, 4, dim=0)
+                # squeeze each token to create the msg_tokens in right dim
+                msg_tokens = [msg_token.squeeze(0) for msg_token in new_msg_tokens_list]
+                # cat on dim=1 to create the whole token
+                msg_tokens = torch.cat(msg_tokens, dim=1)
             layer_count += 1
-
+        output = layer_deformable_1(output, pos, reference_points, spatial_shapes, padding_mask)
         return output
 
 
@@ -512,6 +561,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.forward_ffn(tgt)
 
         return tgt
+
 
 
 class DeformableTransformerDecoder(nn.Module):
