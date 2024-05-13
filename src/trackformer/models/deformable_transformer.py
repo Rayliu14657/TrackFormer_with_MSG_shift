@@ -477,7 +477,7 @@ class DeformableTransformerEncoder(nn.Module):
         # train with msg_tokens block
         layer_count = 0
         for _, layer in enumerate(self.msg_layers):
-            output, msg_tokens = layer(output, pos, reference_points, spatial_shapes, padding_mask, msg_tokens)
+            output, msg_tokens = layer(output, padding_mask, msg_tokens)
             # perform the msg token shuffle
             # only shuffles when the msg_shift directions are inited
             if self.msg_shift:
