@@ -137,4 +137,4 @@ dist_url: env://
 vis_server: 'http://localhost'
 vis_port: 8091
 vis_and_log_interval: 50
-no_vis: true
+no_vis: false
