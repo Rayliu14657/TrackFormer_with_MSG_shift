@@ -139,6 +139,7 @@ class DeformableTransformer(nn.Module):
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
+        lvl_embed_flatten = []
         spatial_shapes = []
         for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
@@ -147,9 +148,11 @@ class DeformableTransformer(nn.Module):
             src = src.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            lvl_embed = self.level_embed[lvl].view(1, 1, -1)
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             # lvl_pos_embed = pos_embed + self.level_embed[lvl % self.num_feature_levels].view(1, 1, -1)
             lvl_pos_embed_flatten.append(lvl_pos_embed)
+            lvl_embed_flatten.append(lvl_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
         src_flatten = torch.cat(src_flatten, 1)
@@ -171,10 +174,11 @@ class DeformableTransformer(nn.Module):
                 spatial_shapes[self.num_feature_levels // 2:],
                 valid_ratios[:, self.num_feature_levels // 2:],
                 lvl_pos_embed_flatten[:, src_flatten.shape[1] // 2:],
+                lvl_embed_flatten,
                 mask_flatten[:, src_flatten.shape[1] // 2:])
             memory = torch.cat([memory, prev_memory], 1)
         else:
-            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, lvl_pos_embed_flatten, lvl_embed_flatten, mask_flatten)
 
         # prepare input for decoder
         bs, _, c = memory.shape
@@ -373,18 +377,25 @@ class TransformerWithMSGEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, padding_mask=None, msg_tokens=None):
+    def forward(self, src, padding_mask=None, msg_tokens=None, spatial_shapes=None):
         # keep the original size of the src tokens
         batch_size, n, d = src.shape
         if msg_tokens is not None:
             msg_len = msg_tokens.shape[1]
-            # chunk the msg_tokens into 4 windows
-            window_num = 4
+            # chunk the msg_tokens in different scales
+            scales = spatial_shapes.shape[0]
+            scale_lens = []
+            for i in range(scales):
+                height = spatial_shapes[i][0]
+                width = spatial_shapes[i][1]
+                scale_len = height*width
+                scale_lens.append(scale_len)
+            window_num = scales
             chunked_msg_tokens = msg_tokens.chunk(window_num, dim=1)
             # chunk the src tokens into 4 windows
-            chunked_src = src.chunk(window_num, dim=1)
+            chunked_src = torch.split(src, scale_lens, dim=1)
             # chunk the src mask into 4 windows
-            chunked_padding_mask = padding_mask.chunk(window_num, dim=1)
+            chunked_padding_mask = torch.split(padding_mask, scale_lens, dim=1)
             # cat each window a msg_token, also adjust the mask
             src_windows = []
             msg_windows = []
@@ -475,12 +486,12 @@ class DeformableTransformerEncoder(nn.Module):
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         layer_deformable_0 = self.layers[0]
         layer_deformable_1 = self.layers[1]
-        # train with deformable transformer
+        # # train with deformable transformer
         output = layer_deformable_0(output, pos, reference_points, spatial_shapes, padding_mask)
         # train with msg_tokens block
         layer_count = 0
         for _, layer in enumerate(self.msg_layers):
-            output, msg_tokens = layer(output, padding_mask, msg_tokens)
+            output, msg_tokens = layer(output, padding_mask, msg_tokens, spatial_shapes)
             # perform the msg token shuffle
             # only shuffles when the msg_shift directions are inited
             if self.msg_shift:
