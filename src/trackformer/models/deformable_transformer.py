@@ -139,7 +139,6 @@ class DeformableTransformer(nn.Module):
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
-        lvl_embed_flatten = []
         spatial_shapes = []
         for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
@@ -148,11 +147,9 @@ class DeformableTransformer(nn.Module):
             src = src.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
-            lvl_embed = self.level_embed[lvl].view(1, 1, -1)
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             # lvl_pos_embed = pos_embed + self.level_embed[lvl % self.num_feature_levels].view(1, 1, -1)
             lvl_pos_embed_flatten.append(lvl_pos_embed)
-            lvl_embed_flatten.append(lvl_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
         src_flatten = torch.cat(src_flatten, 1)
@@ -174,11 +171,10 @@ class DeformableTransformer(nn.Module):
                 spatial_shapes[self.num_feature_levels // 2:],
                 valid_ratios[:, self.num_feature_levels // 2:],
                 lvl_pos_embed_flatten[:, src_flatten.shape[1] // 2:],
-                lvl_embed_flatten,
                 mask_flatten[:, src_flatten.shape[1] // 2:])
             memory = torch.cat([memory, prev_memory], 1)
         else:
-            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, lvl_pos_embed_flatten, lvl_embed_flatten, mask_flatten)
+            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
 
         # prepare input for decoder
         bs, _, c = memory.shape
