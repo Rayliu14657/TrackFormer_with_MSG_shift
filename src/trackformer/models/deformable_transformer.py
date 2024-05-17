@@ -327,20 +327,22 @@ class TransformerWithMSGEncoderLayer(nn.Module):
         # follow the positional encoding function in the PositionEmbeddingSine3D
         src_shape = src.shape
         batch_size, n, d = src_shape
-
-        # concat the src tokens with the msg_token
-        src = torch.cat((src, msg_tokens), dim=1)
-
-        # msg_token len
-        msg_len = msg_tokens.shape[1]
-
         num_pos_feats = d
 
-        # generate the mask for the msg_tokens
-        msg_mask = torch.full((batch_size, msg_len), False, dtype=torch.bool, device=src.device)
+        # concat the src tokens with the msg_token
+        if msg_tokens is not None:
+            src = torch.cat((src, msg_tokens), dim=1)
 
-        # concat the msg_mask and the padding_mask to create the new src_mask
-        src_mask = torch.cat((padding_mask, msg_mask), dim=1)
+            # msg_token len
+            msg_len = msg_tokens.shape[1]
+
+            # generate the mask for the msg_tokens
+            msg_mask = torch.full((batch_size, msg_len), False, dtype=torch.bool, device=src.device)
+
+            # concat the msg_mask and the padding_mask to create the new src_mask
+            src_mask = torch.cat((padding_mask, msg_mask), dim=1)
+        else:
+            src_mask = padding_mask
 
         # generate the positional embedding
         assert src_mask is not None
@@ -356,7 +358,11 @@ class TransformerWithMSGEncoderLayer(nn.Module):
 
         pos = pos[:, :, None] / dim_t
 
-        PE = torch.zeros(batch_size, n + msg_len, d, device=src.device)
+        if msg_tokens is not None:
+            msg_len = msg_tokens.shape[1]
+            PE = torch.zeros(batch_size, n + msg_len, d, device=src.device)
+        else:
+            PE = torch.zeros(batch_size, n, d, device=src.device)
 
         PE[:, :, 0::2] = pos[:, :, 0::2].sin()
         PE[:, :, 1::2] = pos[:, :, 1::2].cos()
@@ -376,22 +382,26 @@ class TransformerWithMSGEncoderLayer(nn.Module):
     def forward(self, src, padding_mask=None, msg_tokens=None, spatial_shapes=None):
         # keep the original size of the src tokens
         batch_size, n, d = src.shape
+        scales = spatial_shapes.shape[0]
+        scale_lens = []
+        for i in range(scales):
+            height = spatial_shapes[i][0]
+            width = spatial_shapes[i][1]
+            scale_len = height * width
+            scale_lens.append(scale_len)
+        window_num = scales
+        # chunk the src tokens into 4 windows
+        chunked_src = torch.split(src, scale_lens, dim=1)
+        # chunk the src mask into 4 windows
+        chunked_padding_mask = torch.split(padding_mask, scale_lens, dim=1)
+
         if msg_tokens is not None:
+
             msg_len = msg_tokens.shape[1]
             # chunk the msg_tokens in different scales
-            scales = spatial_shapes.shape[0]
-            scale_lens = []
-            for i in range(scales):
-                height = spatial_shapes[i][0]
-                width = spatial_shapes[i][1]
-                scale_len = height*width
-                scale_lens.append(scale_len)
-            window_num = scales
+
             chunked_msg_tokens = msg_tokens.chunk(window_num, dim=1)
-            # chunk the src tokens into 4 windows
-            chunked_src = torch.split(src, scale_lens, dim=1)
-            # chunk the src mask into 4 windows
-            chunked_padding_mask = torch.split(padding_mask, scale_lens, dim=1)
+
             # cat each window a msg_token, also adjust the mask
             src_windows = []
             msg_windows = []
@@ -428,6 +438,31 @@ class TransformerWithMSGEncoderLayer(nn.Module):
 
             return src, msg_tokens
         else:
+            print("no msg_tokens!\n")
+            src_windows = []
+            for src_window, mask_window in zip(chunked_src, chunked_padding_mask):
+                # get the new pos
+                src_window, pos_window, mask_window = self.positional_encoding_with_MSG(src_window,
+                                                                                        None,
+                                                                                        mask_window)
+                # calculate self attention on src tokens with msg tokens
+                q_init = k_init = self.with_pos_embed(src_window, pos_window)
+                # turn the tensors from (n,l,c) to (l,n,c)
+                q_init = q_init.permute(1, 0, 2)
+                k_init = k_init.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window2 = self.msg_attention(q_init, k_init, value=src_window, attn_mask=None,
+                                                 key_padding_mask=mask_window)[0]
+                # turn the tensors from (l,n,c) to (n,l,c)
+                src_window2 = src_window2.permute(1, 0, 2)
+                src_window = src_window.permute(1, 0, 2)
+                src_window = src_window + self.dropout_msg(src_window2)
+                src_window_fin = self.norm_msg(src_window)
+
+                # ffn
+                src_window_fin = self.forward_ffn(src_window_fin)
+                src_windows.append(src_window_fin)
+            src = torch.cat(src_windows, dim=1)
             return src, None
 
 
@@ -444,17 +479,21 @@ class DeformableTransformerEncoder(nn.Module):
         self.shift_strides = [1, -1, 2, -2]
         self.msg_token_len = 256
 
-        # set shift directions of msg-tokens for each layer
-        msg_encoder_layers = self.num_msg_layers
-        for lid in range(msg_encoder_layers):
-            if lid % 2 == 0:
-                # append the [1,-1,2,-2] into the msg_shift
-                self.msg_shift.append([_ for _ in self.shift_strides])
+        # do msg_shift or not
+        self.do_msg_shift = True
 
-            else:
-                # append the [-1,1,-2,2] into the msg_shift
-                # shift back
-                self.msg_shift.append([-_ for _ in self.shift_strides])
+        # set shift directions of msg-tokens for each layer
+        if self.do_msg_shift:
+            msg_encoder_layers = self.num_msg_layers
+            for lid in range(msg_encoder_layers):
+                if lid % 2 == 0:
+                    # append the [1,-1,2,-2] into the msg_shift
+                    self.msg_shift.append([_ for _ in self.shift_strides])
+
+                else:
+                    # append the [-1,1,-2,2] into the msg_shift
+                    # shift back
+                    self.msg_shift.append([-_ for _ in self.shift_strides])
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -474,11 +513,14 @@ class DeformableTransformerEncoder(nn.Module):
         output = src
         src_shape = src.shape
         batch_size, n, d = src_shape
-        # initialize the msg_tokens with zeros in the shape of (batch_size, msg_token_len, d_model)
-        msg_tokens = nn.Parameter(torch.zeros(batch_size, self.msg_token_len, d)).requires_grad_(True)
-        # initialize the msg_tokens
-        torch.nn.init.trunc_normal_(msg_tokens, std=.02)
-        msg_tokens = msg_tokens.to(src.device)
+        if self.do_msg_shift:
+            # initialize the msg_tokens with zeros in the shape of (batch_size, msg_token_len, d_model)
+            msg_tokens = nn.Parameter(torch.zeros(batch_size, self.msg_token_len, d)).requires_grad_(True)
+            # initialize the msg_tokens
+            torch.nn.init.trunc_normal_(msg_tokens, std=.02)
+            msg_tokens = msg_tokens.to(src.device)
+        else:
+            msg_tokens = None
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         layer_deformable_0 = self.layers[0]
         layer_deformable_1 = self.layers[1]
@@ -490,7 +532,7 @@ class DeformableTransformerEncoder(nn.Module):
             output, msg_tokens = layer(output, padding_mask, msg_tokens, spatial_shapes)
             # perform the msg token shuffle
             # only shuffles when the msg_shift directions are inited
-            if self.msg_shift:
+            if self.do_msg_shift:
                 current_msg_shift_direction = self.msg_shift[layer_count]
                 # chunk the msg_token to re-produse the msg_tokens for each window
                 chunked_msg_tokens = msg_tokens.chunk(len(current_msg_shift_direction), dim=1)
